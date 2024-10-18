@@ -1,0 +1,10 @@
+[package]
+name = "dnsfs-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fuse = "0.3.1"
+fuser = "0.14.0"
+libc = "0.2.159"
+serde_json = "1.0.128"
