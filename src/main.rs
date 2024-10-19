@@ -306,32 +306,6 @@ impl TreeFilesystem {
         }
     }
 
-    fn get_inode_num_by_path(&self, path: String) -> Option<u64> {
-        for (ino_num, ino_data) in &self.tree {
-            if path == *ino_data.path() {
-                return Some(ino_num.clone());
-            }
-        }
-        return None;
-    }
-
-    fn get_path_by_inode_num(&self, ino: u64) -> Option<String> {
-        for (ino_num, ino_data) in &self.tree {
-            if *ino_num == ino {
-                return Some(ino_data.path().to_string());
-            }
-        }
-        return None;
-    }
-
-    fn get_tree(&self) -> &BTreeMap<u64, Inode> {
-        &self.tree
-    }
-
-    fn iter_inodes(&self) -> btree_map::Iter<'_, u64, Inode> {
-        self.tree.iter()
-    }
-
     fn can_read(&self, mode: u16, uid: u32, gid: u32, req_uid: u32, req_gid: u32) -> bool {
         let is_owner = req_uid == uid;
         let is_in_grp = req_gid == gid;
