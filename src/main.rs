@@ -1,165 +1,19 @@
+mod inode;
+use inode::{Inode, DirectoryInode, FileInode, InodeTrait};
 use std::env;
 use std::path::Path;
 use std::ffi::OsStr;
-use std::collections::btree_map;
-use libc::{timespec, c_int};
+use libc::c_int;
 use libc::{EBADF, EPERM, EACCES, S_ISGID, ENOENT, ENOSYS, EINVAL, EEXIST};
-use libc::{W_OK, R_OK, X_OK, O_RDONLY, O_WRONLY, O_RDWR, O_TRUNC, O_ACCMODE};
-use std::time::{SystemTime, Duration, UNIX_EPOCH};
-use fuser::{TimeOrNow, FileAttr, FileType, Filesystem, Request, ReplyAttr, ReplyData, ReplyEntry, ReplyDirectory, ReplyEmpty, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyCreate, MountOption};
-use fuser::consts::FOPEN_DIRECT_IO;
+use libc::{W_OK, R_OK, X_OK, O_RDONLY, O_WRONLY, O_RDWR, O_ACCMODE};
+use std::time::{SystemTime, Duration};
+use fuser::{TimeOrNow, FileAttr, FileType, Filesystem, Request, ReplyAttr, ReplyData, ReplyEntry, ReplyDirectory, ReplyEmpty, ReplyOpen, ReplyWrite, ReplyCreate, MountOption};
 use std::collections::BTreeMap;
 
 const FILE_HANDLE_READ_BIT: u64 = 1 << 63;
 const FILE_HANDLE_WRITE_BIT: u64 = 1 << 62;
 
 const FMODE_EXEC: i32 = 0x20;
-
-#[derive(Debug,Clone,PartialEq)]
-struct FileInode {
-    inode_num: u64,
-    attrs: FileAttr,
-    path: String,
-    data: String, //Should be base64 encoded
-    num_links: u32,
-    name: String,
-    parent: u64,
-}
-
-#[derive(Debug,Clone,PartialEq)]
-struct DirectoryInode {
-    inode_num: u64,
-    attrs: FileAttr,
-    path: String,
-    contents: Vec<u64>, //List of inode numbers of contents
-    num_links: u32,
-    parent: u64,
-    name: String,
-}
-
-#[derive(Debug,Clone,PartialEq)]
-enum Inode {
-    FileInode(FileInode),
-    DirectoryInode(DirectoryInode),
-}
-
-trait InodeTrait {
-    fn inode_num(&self) -> u64;
-    fn attrs(&self) -> &FileAttr;
-    fn path(&self) -> &String;
-    fn data(&self) -> &String;
-    fn parent(&self) -> u64;
-    fn name(&self) -> &String;
-    fn contents(&self) -> &Vec<u64>;
-    fn set_attrs(&mut self, _: FileAttr);
-    fn set_path(&mut self, _: String);
-    fn set_inode_num(&mut self, _: u64);
-    fn set_parent(&mut self, _:u64);
-    fn set_data(&mut self, _: String);
-    fn set_contents(&mut self, _: Vec<u64>);
-}
-
-impl InodeTrait for Inode {
-    fn inode_num(&self) -> u64 {
-        match self {
-            Inode::FileInode(ref a) => return a.inode_num.clone(),
-            Inode::DirectoryInode(ref b) => return b.inode_num.clone(),
-        };
-    }
-    fn attrs(&self) -> &FileAttr {
-        match self {
-            Inode::FileInode(ref a) => return &a.attrs,
-            Inode::DirectoryInode(ref b) => return &b.attrs,
-        };
-    }
-    fn path(&self) -> &String {
-        match self {
-            Inode::FileInode(ref a) => return &a.path,
-            Inode::DirectoryInode(ref b) => return &b.path,
-        };
-    }
-    fn data(&self) -> &String {
-        match self {
-            Inode::FileInode(ref a) => return &a.data,
-            Inode::DirectoryInode(_) => todo!(),
-        };
-    }
-    fn parent(&self) -> u64 {
-        match self {
-            Inode::FileInode(ref a) => return a.parent.clone(),
-            Inode::DirectoryInode(ref b) => return b.parent.clone(),
-        };
-    }
-
-    fn name(&self) -> &String {
-        match self {
-            Inode::FileInode(ref a) => return &a.name,
-            Inode::DirectoryInode(ref b) => return &b.name,
-        };
-    }
-
-    fn contents(&self) -> &Vec<u64> {
-        match self {
-            Inode::FileInode(_) => todo!(),
-            Inode::DirectoryInode(ref b) => return &b.contents,
-        }
-    }
-
-    fn set_attrs(&mut self, attrs: FileAttr) {
-        match self {
-            Inode::FileInode(ref mut a) =>  a.attrs = attrs,
-            Inode::DirectoryInode(ref mut b) =>  b.attrs = attrs,
-        };
-    }
-
-    fn set_path(&mut self, path: String) {
-        match self {
-            Inode::FileInode(ref mut a) =>  a.path = path,
-            Inode::DirectoryInode(ref mut b) =>  b.path = path,
-        };
-    }
-
-    fn set_inode_num(&mut self, ino: u64) {
-        match self {
-            Inode::FileInode(ref mut a) =>  {
-                a.inode_num = ino.clone();
-                a.attrs.ino = ino.clone();
-            },
-            Inode::DirectoryInode(ref mut b) =>  {
-                b.inode_num = ino.clone();
-                b.attrs.ino = ino.clone();
-            },
-        };
-    }
-    fn set_parent(&mut self, parent: u64) {
-        match self {
-            Inode::FileInode(ref mut a) =>  a.parent = parent,
-            Inode::DirectoryInode(ref mut b) =>  b.parent = parent,
-        };
-    }
-    fn set_data(&mut self, data: String) {
-        match self {
-            Inode::FileInode(ref mut a) =>  a.data = data.to_string(),
-            Inode::DirectoryInode(_) => todo!(),
-        };
-    }
-    fn set_contents(&mut self, data: Vec<u64>) {
-        match self {
-            Inode::FileInode(_) =>  todo!(),
-            Inode::DirectoryInode(ref mut a) => a.contents = data.clone(),
-        };
-    }
-}
-
-
-struct JsonFilesystem {
-    tree: BTreeMap<String, String>,
-    attrs: BTreeMap<u64, FileAttr>,
-    inodes: BTreeMap<String, u64>,
-    cur_inode: u64,
-    block_size: u32,
-    file_handles: BTreeMap<u64, u64>,
-}
 
 #[derive(Debug)]
 struct TreeFilesystem {
@@ -171,8 +25,8 @@ struct TreeFilesystem {
 
 impl TreeFilesystem {
     fn new(contents: &BTreeMap<String, String>) -> TreeFilesystem {
-        let mut tree = BTreeMap::new();
-        let mut file_handles = BTreeMap::new();
+        let tree = BTreeMap::new();
+        let file_handles = BTreeMap::new();
         let mut fs = TreeFilesystem{
             tree: tree,
             cur_inode: 0,
@@ -274,7 +128,7 @@ impl TreeFilesystem {
     }
 
     fn allocate_file_handle(&mut self, ino: u64, can_read: bool, can_write: bool) -> u64 {
-        let mut fh_num: u64 = 0;
+        let fh_num: u64;
         if let Some(curfh) = self.file_handles.get(&ino) {
             fh_num = curfh + 1;
         } else {
@@ -376,7 +230,6 @@ impl Filesystem for TreeFilesystem {
         // Must have execute on dir for either owner (and be owner), group (and be in group), or
         // other 
         //TODO: Fix this by inferring . and .. based upon tree
-        let mut count = 0;
         let dir_inode = self.get_inode(ino).unwrap();//match self.get_inode(ino).unwrap() {
         //dbg!(dir_inode);
         let dir_contents = dir_inode.contents().clone();
@@ -454,35 +307,35 @@ impl Filesystem for TreeFilesystem {
     fn open(&mut self, req: &Request, inode: u64, flags: i32, reply: ReplyOpen) {
         println!("Open started");
         let acc = flags & O_ACCMODE;
-        let mut write_allowed = false;
-        let mut read_allowed = false;
-        let mut exec_allowed = false;
-        let mut mode: c_int = 0;
+        let mut mode: c_int;
 
-        if acc == O_RDONLY {
-            read_allowed = true;
-            mode = R_OK;
-            // This is undefined behavior; so we bail
-            if flags & libc::O_TRUNC != 0 {
-                println!("O_TRUNC");
-                reply.error(EACCES);
+        let (read_allowed, write_allowed, exec_allowed) = match acc {
+            O_RDONLY => {
+                let r = true;
+                mode = R_OK;
+                // This is undefined behavior; so we bail
+                if flags & libc::O_TRUNC != 0 {
+                    reply.error(EACCES);
+                    return;
+                }
+                if flags & FMODE_EXEC != 0{
+                    mode = X_OK;
+                }
+                (r, false, false)
+            },
+            O_WRONLY => {
+                mode = W_OK;
+                (false, true, false)
+            },
+            O_RDWR => {
+                mode = R_OK | W_OK;
+                (true, true, false)
+            },
+            _ => {
+                reply.error(EINVAL);
                 return;
             }
-            if flags & FMODE_EXEC != 0{
-                mode = X_OK;
-            }
-        } else if acc == O_WRONLY {
-            write_allowed = true;
-            mode = W_OK;
-        } else if acc == O_RDWR {
-            read_allowed = true;
-            write_allowed = true;
-            mode = R_OK | W_OK;
-        } else {
-            println!("Weird flags found in open");
-            reply.error(EINVAL);
-            return;
-        }
+        };
 
         println!("open(inode={}, flags={}, mode={}, acc={})", inode, flags, mode, acc);
 
@@ -497,15 +350,22 @@ impl Filesystem for TreeFilesystem {
             },
         };
 
-        let mut perms_match = false;
-        match mode {
-            R_OK => perms_match = self.can_read(ino_data.attrs().perm, ino_data.attrs().uid, ino_data.attrs().gid, req.uid(), req.gid()),
-            W_OK => perms_match = self.can_write(ino_data.attrs().perm, ino_data.attrs().uid, ino_data.attrs().gid, req.uid(), req.gid()),
-            X_OK => perms_match = self.can_execute(ino_data.attrs().perm, ino_data.attrs().uid, ino_data.attrs().gid, req.uid(), req.gid()),
-            R_OK | W_OK => perms_match = self.can_write(ino_data.attrs().perm, ino_data.attrs().uid, ino_data.attrs().gid, req.uid(), req.gid()) && self.can_read(ino_data.attrs().perm, ino_data.attrs().uid, ino_data.attrs().gid, req.uid(), req.gid()),
-            _ => {
-                reply.error(EACCES);
-                return;
+        let mut perms_match = true;
+        if read_allowed {
+            if !self.can_read(ino_data.attrs().perm, ino_data.attrs().uid, ino_data.attrs().gid, req.uid(), req.gid()) {
+                perms_match = false;
+            }
+        }
+
+        if write_allowed {
+            if !self.can_write(ino_data.attrs().perm, ino_data.attrs().uid, ino_data.attrs().gid, req.uid(), req.gid()) {
+                perms_match = false;
+            }
+        }
+
+        if exec_allowed {
+            if !self.can_execute(ino_data.attrs().perm, ino_data.attrs().uid, ino_data.attrs().gid, req.uid(), req.gid()) {
+                perms_match = false;
             }
         }
         
@@ -588,7 +448,7 @@ impl Filesystem for TreeFilesystem {
                 return;
             }
         };
-        if let perms = self.can_write(ino_data.attrs().perm, ino_data.attrs().uid, ino_data.attrs().gid, req.uid(), req.gid()) {
+        if self.can_write(ino_data.attrs().perm, ino_data.attrs().uid, ino_data.attrs().gid, req.uid(), req.gid()) {
             // Update the metadata for the parent
             let now = SystemTime::now();
             let mut ino_attrs = ino_data.attrs().clone();
@@ -620,10 +480,9 @@ impl Filesystem for TreeFilesystem {
             reply.error(EACCES);
             return;
         }
-        reply.error(ENOSYS);
     }
 
-    fn create(&mut self, req: &Request, parent: u64, name: &OsStr, mut mode: u32, umask: u32, flags: i32, reply: ReplyCreate) {
+    fn create(&mut self, req: &Request, parent: u64, name: &OsStr, mode: u32, umask: u32, flags: i32, reply: ReplyCreate) {
         println!("create(parent={}, name={}, mode={}, umask={} flags={})", parent, name.to_str().unwrap(), mode, umask, flags);
         //TODO: Add multi-level path support
         //let parent_path = self.get_path_by_inode(parent);
@@ -704,7 +563,6 @@ impl Filesystem for TreeFilesystem {
             reply.error(EACCES);
             return;
         }
-        reply.error(EPERM);
     }
 
     fn rename(&mut self, req: &Request, parent: u64, name: &OsStr, new_parent: u64, new_name: &OsStr, flags: u32, reply: ReplyEmpty) {
