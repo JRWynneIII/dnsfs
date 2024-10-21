@@ -17,7 +17,7 @@ const FMODE_EXEC: i32 = 0x20;
 
 #[derive(Debug)]
 struct TreeFilesystem {
-    tree: BTreeMap<u64, Inode>, //tree[inode_num] = inode
+    tree: BTreeMap<u64, Inode>, 
     cur_inode: u64,
     block_size: u32,
     file_handles: BTreeMap<u64, u64>,
@@ -30,7 +30,7 @@ impl TreeFilesystem {
         let mut fs = TreeFilesystem{
             tree: tree,
             cur_inode: 0,
-            block_size: 4096,
+            block_size: 512,
             file_handles: file_handles,
         };
 
@@ -74,7 +74,7 @@ impl TreeFilesystem {
                     inode_num: self.cur_inode,
                     attrs: attr,
                     path: path.clone(),
-                    data: data.clone(),
+                    data: data.clone().into(),
                     num_links: attr.nlink,
                     parent: parent,
                     name: name,
@@ -242,7 +242,7 @@ impl Filesystem for TreeFilesystem {
                     Some(a) => a.clone(),
                     None => todo!(),
                 };
-                dbg!(ino_data.clone());
+                //dbg!(ino_data.clone());
                 println!("\tkey={}, inode={}, offset={}", ino_data.name(), ino_data.inode_num(), offset);
                 let _ = reply.add(ino_data.inode_num(), (idx as i64) + 2, ino_data.attrs().kind, &Path::new(ino_data.name()));
             }
@@ -290,6 +290,7 @@ impl Filesystem for TreeFilesystem {
 		Inode::DirectoryInode(ref b) => Inode::DirectoryInode(b.clone()),
             },
             None => {
+                println!("EPERM");
                 reply.error(EPERM);
                 return;
             },
@@ -297,7 +298,12 @@ impl Filesystem for TreeFilesystem {
 
 
         if self.can_read(ino_data.attrs().perm, ino_data.attrs().uid, ino_data.attrs().gid, req.uid(), req.gid()) {
-            reply.data(ino_data.data().to_string().as_bytes());
+            let file_data = ino_data.data().as_slice();
+            let mut end = (offset + (size as i64)) as usize;
+            if (file_data.len()) < end   {
+                end = file_data.len();
+            }
+            reply.data(&file_data[(offset as usize)..end]);
         } else {
             reply.error(EACCES);
             println!("Can't read")
@@ -398,23 +404,32 @@ impl Filesystem for TreeFilesystem {
             },
         };
 
-        let cur_data = ino_data.data().to_string();
-        let mut new_data = Vec::new();
+        //let cur_data = ino_data.data().as_slice();
+        let mut new_data: Vec<u8> = ino_data.data().clone();
+        //Do not define the end of the range, because this will allow it to overwrite. If you
+        //define the range as offset..offset, then it will *insert* the whole slice at offset
+        new_data.splice((offset as usize).., data.iter().copied());
+        println!("new_data.len == {}", new_data.len());
 
-        for i in 0..(offset) {
-            new_data.push(cur_data.as_bytes()[i as usize].clone());
-        }
+       //// new_data.reserve(data.len());
+       //// let mut v = new_data.split_off((offset - 1) as usize);
+       //// new_data.extend_from_slice(data);
+       //// new_data.append(&mut v);
 
-        for byte in data.iter() {
-            new_data.push(byte.clone());
-        }
+       // for i in 0..(offset) {
+       //     new_data.push(cur_data[i as usize].clone());
+       // }
 
-        for i in offset+1..(cur_data.len() as i64 - 1) {
-            new_data.push(cur_data.as_bytes()[i as usize].clone());
-        }
+        //for byte in data.iter() {
+        //    new_data.push(byte.clone());
+        //}
+
+        //for i in offset+1..(cur_data.len() as i64 - 1) {
+        //    new_data.push(cur_data[i as usize].clone());
+        //}
 
         let new_length = new_data.len();
-        ino_data.set_data(String::from_utf8(new_data).expect("Our bytes should be valid utf8"));
+        ino_data.set_data(new_data);
 
         let now = SystemTime::now();
         let mut attrs = ino_data.attrs().clone();
@@ -449,19 +464,14 @@ impl Filesystem for TreeFilesystem {
             }
         };
         if self.can_write(ino_data.attrs().perm, ino_data.attrs().uid, ino_data.attrs().gid, req.uid(), req.gid()) {
-            // Update the metadata for the parent
-            let now = SystemTime::now();
-            let mut ino_attrs = ino_data.attrs().clone();
-            ino_attrs.mtime = now;
-            ino_attrs.atime = now;
-            ino_data.set_attrs(ino_attrs);
-
-            //Update the inode in the tree
-            self.set_inode(parent, ino_data.clone());
 
             // Infer the path for the target
             //let parent_path = self.get_path_by_inode(parent);
             //let target_path = Path::new(&parent_path).join(name.to_str().expect("")).into_os_string().into_string().unwrap();
+            let now = SystemTime::now();
+            let mut ino_attrs = ino_data.attrs().clone();
+            let mut ino_contents = ino_data.contents().clone();
+
             for ino in ino_data.contents() {
                 let cur = match self.get_inode(*ino) {
                     Some(a) => a.clone(),
@@ -470,9 +480,21 @@ impl Filesystem for TreeFilesystem {
 
                 if cur.name().clone() == name.to_string_lossy() {
                     self.remove_inode(*ino);
+                     if let Some(index) = ino_contents.iter().position(|x| *x == *ino) {
+                        ino_contents.remove(index);
+                    }
                     break;
                 }
             }
+            //
+            // Update the metadata for the parent
+            ino_attrs.mtime = now;
+            ino_attrs.atime = now;
+            ino_data.set_attrs(ino_attrs);
+            ino_data.set_contents(ino_contents);
+
+            //Update the inode in the tree
+            self.set_inode(parent, ino_data.clone());
             // Remove the target inode
             reply.ok();
             return;
@@ -725,7 +747,9 @@ impl Filesystem for TreeFilesystem {
     }
 
     //fn symlink(&mut self, _req: &Request, parent: u64, link_name: &OsStr, target: &Path, reply: ReplyEntry) {
-    //    println!("symlink(parent={}, link_name={}, target={})", parent, link_name, target);
+    //    println!("symlink(parent={}, link_name={}, target={})", parent, link_name.to_string_lossy(), target);
+    //    //Increase Link Number on target
+    //    //add a new file inode (or a new type of SymlinkInode?)
     //    reply.error(ENOSYS);
     //}
 

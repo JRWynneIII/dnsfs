@@ -5,7 +5,7 @@ pub struct FileInode {
     pub inode_num: u64,
     pub attrs: FileAttr,
     pub path: String,
-    pub data: String, //Should be base64 encoded
+    pub data: Vec<u8>, //Should be base64 encoded
     pub num_links: u32,
     pub name: String,
     pub parent: u64,
@@ -32,7 +32,7 @@ pub trait InodeTrait {
     fn inode_num(&self) -> u64;
     fn attrs(&self) -> &FileAttr;
     fn path(&self) -> &String;
-    fn data(&self) -> &String;
+    fn data(&self) -> &Vec<u8>;
     #[allow(dead_code)]
     fn parent(&self) -> u64;
     fn name(&self) -> &String;
@@ -43,7 +43,7 @@ pub trait InodeTrait {
     #[allow(dead_code)]
     fn set_inode_num(&mut self, _: u64);
     fn set_parent(&mut self, _:u64);
-    fn set_data(&mut self, _: String);
+    fn set_data(&mut self, _: Vec<u8>);
     fn set_contents(&mut self, _: Vec<u64>);
 }
 
@@ -66,7 +66,10 @@ impl InodeTrait for Inode {
             Inode::DirectoryInode(ref b) => return &b.path,
         };
     }
-    fn data(&self) -> &String {
+    //TODO: make this return bytes instead of a string
+    //It will have to decode the base64 (or deserialize the bincode) first
+    //Or can we just use bincode to generate the bytes and then base64 that?
+    fn data(&self) -> &Vec<u8> {
         match self {
             Inode::FileInode(ref a) => return &a.data,
             Inode::DirectoryInode(_) => todo!(),
@@ -125,9 +128,11 @@ impl InodeTrait for Inode {
             Inode::DirectoryInode(ref mut b) =>  b.parent = parent,
         };
     }
-    fn set_data(&mut self, data: String) {
+    //TODO: make this take bytes instead of a string, then convert the bytes to base64
+    //Or maybe use bincode?
+    fn set_data(&mut self, data: Vec<u8>) {
         match self {
-            Inode::FileInode(ref mut a) =>  a.data = data.to_string(),
+            Inode::FileInode(ref mut a) =>  a.data = data.clone(),
             Inode::DirectoryInode(_) => todo!(),
         };
     }
