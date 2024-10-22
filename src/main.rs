@@ -1,5 +1,5 @@
 mod inode;
-use inode::{Inode, DirectoryInode, FileInode, InodeTrait};
+use inode::{Inode, DirectoryInode, FileInode, LinkInode, InodeTrait};
 use std::env;
 use std::path::Path;
 use std::ffi::OsStr;
@@ -7,7 +7,7 @@ use libc::c_int;
 use libc::{EBADF, EPERM, EACCES, S_ISGID, ENOENT, ENOSYS, EINVAL, EEXIST};
 use libc::{W_OK, R_OK, X_OK, O_RDONLY, O_WRONLY, O_RDWR, O_ACCMODE};
 use std::time::{SystemTime, Duration};
-use fuser::{TimeOrNow, FileAttr, FileType, Filesystem, Request, ReplyAttr, ReplyData, ReplyEntry, ReplyDirectory, ReplyEmpty, ReplyOpen, ReplyWrite, ReplyCreate, MountOption};
+use fuser::{TimeOrNow, FileAttr, FileType, Filesystem, Request, ReplyAttr, ReplyData, ReplyEntry, ReplyDirectory, ReplyEmpty, ReplyOpen, ReplyWrite, ReplyCreate, MountOption, ReplyStatfs};
 use std::collections::BTreeMap;
 
 const FILE_HANDLE_READ_BIT: u64 = 1 << 63;
@@ -21,10 +21,11 @@ struct TreeFilesystem {
     cur_inode: u64,
     block_size: u32,
     file_handles: BTreeMap<u64, u64>,
+    mountpoint: String,
 }
 
 impl TreeFilesystem {
-    fn new(contents: &BTreeMap<String, String>) -> TreeFilesystem {
+    fn new(contents: &BTreeMap<String, String>, mountpoint: &String) -> TreeFilesystem {
         let tree = BTreeMap::new();
         let file_handles = BTreeMap::new();
         let mut fs = TreeFilesystem{
@@ -32,6 +33,7 @@ impl TreeFilesystem {
             cur_inode: 0,
             block_size: 512,
             file_handles: file_handles,
+            mountpoint: mountpoint.to_string(),
         };
 
         let _ = fs.create_inode("/".to_string(), FileType::Directory, 0o755, 0, 1000, 1000, 0, "".to_string());
@@ -41,6 +43,31 @@ impl TreeFilesystem {
         }
         dbg!(fs.tree.clone());
         fs
+    }
+
+    fn resolve_symlink(&self, inode: &Inode) -> Option<&Inode> {
+        let mut target = match inode.target() {
+            Some(a) => a.clone(),
+            None => return None, // If the current inode's target is None, then this is not a
+                                 // symlink, bro
+        };
+
+        let mut cur_ino = inode.clone();
+
+        while target != 0 {
+            cur_ino = match self.get_inode(target) {
+                Some(a) => {
+                    target = match a.target() {
+                        Some(b) => b.clone(),
+                        None => 0,
+                    };
+                    a.clone()
+                },
+                None => break,
+            };
+        }
+
+        self.get_inode(cur_ino.inode_num())
     }
     
     fn create_inode(&mut self, path: String, ino_type: FileType, mode: u16, size: u64, uid: u32, gid: u32, parent: u64, data: String) -> &Inode {
@@ -99,6 +126,64 @@ impl TreeFilesystem {
             pcontents.push(self.cur_inode);
             parent_inode.set_contents(pcontents);
             self.set_inode(parent_inode.inode_num(), parent_inode);
+        }
+
+        self.set_inode(self.cur_inode, inode);
+        self.get_inode(self.cur_inode).unwrap()
+    }
+
+    fn create_symlink(&mut self, path: String, mode: u16, size: u64, uid: u32, gid: u32, parent: u64, target: u64, target_path: String) -> &Inode {
+        let curtime = SystemTime::now();
+        self.cur_inode += 1;
+        let attr = FileAttr{
+            ino: self.cur_inode,
+            size: size,
+            blocks: (size + self.block_size as u64 - 1) / self.block_size as u64,
+            atime: curtime,
+            mtime: curtime,
+            ctime: curtime,
+            crtime: curtime,
+            kind: FileType::Symlink,
+            perm: mode,
+            nlink: 1,
+            uid: uid,
+            gid: gid,
+            rdev: 0,
+            flags: 0,
+            blksize: self.block_size,
+        };
+
+        let mut name = path.clone();
+        if path != "/" {
+            name = Path::new(&path).file_name().unwrap().to_str().unwrap().to_string();
+        }
+
+        let inode = Inode::LinkInode(LinkInode{
+            inode_num: self.cur_inode,
+            attrs: attr,
+            path: path.clone(),
+            target: target,
+            num_links: attr.nlink,
+            parent: parent,
+            name: name,
+            target_path: target_path,
+        });
+
+        // Update the contents of the parent here!
+        if self.cur_inode != 1 {
+            let mut parent_inode = self.get_inode(parent).unwrap().clone();
+            let mut pcontents = parent_inode.contents().clone();
+            pcontents.push(self.cur_inode);
+            parent_inode.set_contents(pcontents);
+            self.set_inode(parent_inode.inode_num(), parent_inode);
+        }
+
+        if let Some(target_ino) = self.get_inode(target) {
+            let mut mod_target = target_ino.clone();
+            let mut attrs = target_ino.attrs().clone();
+            attrs.nlink += 1;
+            mod_target.set_attrs(attrs);
+            self.set_inode(target, mod_target);
         }
 
         self.set_inode(self.cur_inode, inode);
@@ -214,6 +299,7 @@ impl Filesystem for TreeFilesystem {
             Some(a) => match a {
                 Inode::FileInode(ref a) => Inode::FileInode(a.clone()),
                 Inode::DirectoryInode(ref b) => Inode::DirectoryInode(b.clone()),
+                _ => todo!(),
             },
             None => {
                 reply.error(ENOENT);
@@ -257,8 +343,10 @@ impl Filesystem for TreeFilesystem {
             Some(a) => match a {
                 Inode::FileInode(ref b) => Inode::FileInode(b.clone()),
                 Inode::DirectoryInode(ref c) => Inode::DirectoryInode(c.clone()),
+		Inode::LinkInode(ref c) => Inode::LinkInode(c.clone()),
             },
             None => {
+                println!("Could not find parent during lookup");
                 reply.error(ENOENT);
                 return;
             },
@@ -288,6 +376,14 @@ impl Filesystem for TreeFilesystem {
             Some(a) => match a {
 		Inode::FileInode(ref a) => Inode::FileInode(a.clone()),
 		Inode::DirectoryInode(ref b) => Inode::DirectoryInode(b.clone()),
+		Inode::LinkInode(ref c) => {
+                    if let Some(target_ino) = self.resolve_symlink(a) {
+                        //Inode::FileInode(FileInode(target_ino.clone()))
+                        target_ino.clone()
+                    } else {
+                        Inode::LinkInode(c.clone())
+                    }
+                },
             },
             None => {
                 println!("EPERM");
@@ -349,6 +445,7 @@ impl Filesystem for TreeFilesystem {
             Some(a) => match a {
                 Inode::FileInode(ref b) => Inode::FileInode(b.clone()),
                 Inode::DirectoryInode(ref c) => Inode::DirectoryInode(c.clone()),
+                _ => todo!(),
             },
             None => {
                 reply.error(ENOSYS);
@@ -397,6 +494,7 @@ impl Filesystem for TreeFilesystem {
             Some(a) => match a {
 		Inode::FileInode(ref a) => Inode::FileInode(a.clone()),
 		Inode::DirectoryInode(ref b) => Inode::DirectoryInode(b.clone()),
+                _ => todo!(),
 	    },
             None => {
                 reply.error(EBADF);
@@ -457,6 +555,7 @@ impl Filesystem for TreeFilesystem {
             Some(a) => match a {
                 Inode::FileInode(ref a) => Inode::FileInode(a.clone()),
                 Inode::DirectoryInode(ref b) => Inode::DirectoryInode(b.clone()),
+                _ => todo!(),
             },
             None => {
                 reply.error(EBADF);
@@ -564,6 +663,7 @@ impl Filesystem for TreeFilesystem {
             let target_ino = match self.create_inode(target_path.to_string(), FileType::RegularFile, mode.try_into().unwrap(), 0, req.uid(), req.gid(), parent_inode.inode_num().clone(), "".to_string()) {
                 Inode::FileInode(ref a) => Inode::FileInode(a.clone()),
                 Inode::DirectoryInode(ref b) => Inode::DirectoryInode(b.clone()),
+                _ => todo!(),
             };
             // Update the parent's contents
             let mut parent_contents = parent_inode.contents().clone();
@@ -604,6 +704,7 @@ impl Filesystem for TreeFilesystem {
             Some(a) => match a {
                 Inode::FileInode(ref a) => Inode::FileInode(a.clone()),
                 Inode::DirectoryInode(ref b) => Inode::DirectoryInode(b.clone()),
+                _ => todo!(),
             },
             None => {
                 reply.error(EPERM);
@@ -614,6 +715,7 @@ impl Filesystem for TreeFilesystem {
             Some(a) => match a {
                 Inode::FileInode(ref a) => Inode::FileInode(a.clone()),
                 Inode::DirectoryInode(ref b) => Inode::DirectoryInode(b.clone()),
+                _ => todo!(),
             },
             None => {
                 reply.error(EPERM);
@@ -623,13 +725,14 @@ impl Filesystem for TreeFilesystem {
 
         let tmp_source_path = Path::new(&parent_inode.path()).join(name);
         let source_path = tmp_source_path.to_string_lossy();
-        let tmp_target_path = Path::new(&new_parent_inode.path()).join(new_name) ;
+        let tmp_target_path = Path::new(&new_parent_inode.path()).join(new_name);
         let target_path = tmp_target_path.to_string_lossy();
 
         let mut source_ino = match self.get_inode_by_path(source_path.to_string()) {
             Some(a) => match a {
                 Inode::FileInode(ref a) => Inode::FileInode(a.clone()),
                 Inode::DirectoryInode(ref b) => Inode::DirectoryInode(b.clone()),
+                _ => todo!(),
             },
             None => {
                 reply.error(EPERM);
@@ -688,17 +791,13 @@ impl Filesystem for TreeFilesystem {
 
     }
 
-    fn link(&mut self, _req: &Request, inode: u64, new_parent: u64, new_name: &OsStr, reply: ReplyEntry) {
-        println!("link(inode={}, new_parent={}, new_name={})", inode, new_parent, new_name.to_str().unwrap());
-        reply.error(ENOSYS);
-    }
-
     fn setattr(&mut self, req: &Request, inode: u64, mode: Option<u32>, uid: Option<u32>, gid: Option<u32>, size: Option<u64>, atime: Option<TimeOrNow>, mtime: Option<TimeOrNow>, _ctime: Option<SystemTime>, fh: Option<u64>, _crtime: Option<SystemTime>, _chgtime: Option<SystemTime>, _bkuptime: Option<SystemTime>, _flags: Option<u32>, reply: ReplyAttr) {
        println!("setattr(inode={:?}, mode={:?}, uid={:?}, gid={:?}, size={:?}, atime={:?}, mtime={:?}, fh={:?})", inode, mode, uid, gid, size, atime, mtime, fh);
        let mut ino_data = match self.get_inode(inode) {
            Some(a) => match a {
                Inode::FileInode(ref a) => Inode::FileInode(a.clone()),
                Inode::DirectoryInode(ref b) => Inode::DirectoryInode(b.clone()),
+                _ => todo!(),
            },
            None => {
                reply.error(EPERM);
@@ -746,20 +845,103 @@ impl Filesystem for TreeFilesystem {
        reply.attr(&Duration::new(0, 0), &ino_data.attrs());
     }
 
-    //fn symlink(&mut self, _req: &Request, parent: u64, link_name: &OsStr, target: &Path, reply: ReplyEntry) {
-    //    println!("symlink(parent={}, link_name={}, target={})", parent, link_name.to_string_lossy(), target);
-    //    //Increase Link Number on target
-    //    //add a new file inode (or a new type of SymlinkInode?)
+    fn symlink(&mut self, req: &Request, parent: u64, link_name: &OsStr, target: &Path, reply: ReplyEntry) {
+        println!("symlink(parent={}, link_name={}, target={})", parent, link_name.to_string_lossy(), target.to_string_lossy());
+        if let Some(parent_ino) = self.get_inode(parent) {
+            if self.can_write(parent_ino.attrs().perm, parent_ino.attrs().uid, parent_ino.attrs().gid, req.uid(), req.gid()) {
+                let path = Path::new(parent_ino.path()).join(link_name);
+                // TODO: This will need to be modified so that we can get the full path when we
+                // have directories working
+                let target_path = Path::new(&"/".to_string()).join(target);
+
+                if let Some(target_ino) = self.get_inode_by_path(target_path.to_string_lossy().to_string()) {
+                    // This gets the target path based upon the mountpoint of the filesystem; this
+                    // allows tools like ls and readlink and such to actually find the target,
+                    // since the paths in this filesystem are based upon "/"
+                    //
+                    // NOTE: Maybe we need to change the root inode to something other than "/"? 
+                    // Doubt this will work but idk
+                    let canonical_target = Path::new(&self.mountpoint)
+                        .join(
+                            Path::new(target_ino.path())
+                                .strip_prefix("/")
+                                .unwrap()
+                    );
+
+                    let link = self.create_symlink(path.to_string_lossy().to_string(), 
+                                                    0o777, 
+                                                    target.to_string_lossy().len() as u64, 
+                                                    req.uid(), 
+                                                    req.gid(), 
+                                                    parent, 
+                                                    target_ino.inode_num(),
+                                                    canonical_target.to_string_lossy().to_string(),
+                    );
+
+                    reply.entry(&Duration::new(0, 0), &link.attrs(), 0);
+                    return;
+                } else {
+                    let link = self.create_symlink(path.to_string_lossy().to_string(), 
+                                                    0o777, 
+                                                    target.to_string_lossy().len() as u64, 
+                                                    req.uid(), 
+                                                    req.gid(), 
+                                                    parent, 
+                                                    0,
+                                                    target.to_string_lossy().to_string(),
+                    );
+
+                    reply.entry(&Duration::new(0, 0), &link.attrs(), 0);
+                    return;
+                }
+            } else {
+                reply.error(EACCES);
+                return;
+            }
+        } else {
+            println!("Could not find parent of symlink");
+            reply.error(EPERM);
+            return;
+        }
+    }
+
+    fn readlink(&mut self, req: &Request, inode: u64, reply: ReplyData) {
+        println!("readlink(inode={})", inode);
+
+        let link_inode = self.get_inode(inode).unwrap();
+        if let Some(target_ino) = self.resolve_symlink(link_inode) {
+            if self.can_read(target_ino.attrs().perm, target_ino.attrs().uid, target_ino.attrs().gid, req.uid(), req.gid()) {
+                if let Some(symlink_data) = link_inode.get_symlink_data() {
+                    reply.data(&symlink_data.as_bytes());
+                    return;
+                } else {
+                    reply.data(b"");
+                    return;
+                }
+            } else {
+                println!("Can't read");
+                reply.error(EACCES);
+                return;
+            }
+        }
+
+        reply.error(ENOSYS);
+    }
+    
+
+    //fn link(&mut self, _req: &Request, inode: u64, new_parent: u64, new_name: &OsStr, reply: ReplyEntry) {
+    //    println!("link(inode={}, new_parent={}, new_name={})", inode, new_parent, new_name.to_string_lossy());
     //    reply.error(ENOSYS);
     //}
 
+
     //fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-    //    println!("rmdir(parent={}, name={})", parent, name);
+    //    println!("rmdir(parent={}, name={})", parent, name.to_string_lossy());
     //    reply.error(ENOSYS);
     //}
 
     //fn mkdir(&mut self, _req: &Request, parent: u64, name: &OsStr, mut mode: u32, _umask: u32, reply: ReplyEntry) {
-    //    println!("mkdir(parent={}, name={}, mode={})", parent, name, mode);
+    //    println!("mkdir(parent={}, name={}, mode={})", parent, name.to_string_lossy(), mode);
     //    reply.error(ENOSYS);
     //}
 
@@ -783,11 +965,6 @@ impl Filesystem for TreeFilesystem {
     //    reply.error(ENOSYS);
     //}
 
-    //fn readlink(&mut self, __req: &Request, inode: u64, reply: ReplyData) {
-    //   println!("mkdir(inode={})", inode);
-    //   reply.error(ENOSYS);
-    //}
-    
     //fn fallocate(&mut self, __req: &Request<'_>, inode: u64, _fh: u64, offset: i64, length: i64, mode: i32, reply: ReplyEmpty) {
     //    println!("fallocate(inode={}, offset={}, length={}, mode={})", inode, offset, length, mode);
     //    reply.error(ENOSYS);
@@ -799,7 +976,6 @@ fn main() {
     data.insert("/foo".to_string(), "bar".to_string());
     data.insert("/answer".to_string(), "42".to_string());
 
-    let fs = TreeFilesystem::new(&data);
     let mountpoint = match env::args().nth(1) {
         Some(path) => path,
         None => {
@@ -807,6 +983,9 @@ fn main() {
             return;
         }
     };
+
+    println!("Mount point set to {}", &mountpoint);
+    let fs = TreeFilesystem::new(&data, &mountpoint);
 
     let mut options = Vec::new();
     options.push(MountOption::FSName("jakefs".to_string()));
