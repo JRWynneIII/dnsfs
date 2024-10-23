@@ -59,9 +59,11 @@ pub trait InodeTrait {
     fn set_inode_num(&mut self, _: u64);
     fn set_parent(&mut self, _:u64);
     fn set_data(&mut self, _: Vec<u8>);
+    fn set_name(&mut self, _: String);
     fn set_contents(&mut self, _: Vec<u64>);
     fn set_link_target(&mut self, _: u64);
     fn set_symlink_data(&mut self, _: String);
+    fn write_data(&mut self, _: &[u8], _: usize);
 }
 
 impl InodeTrait for Inode {
@@ -192,9 +194,25 @@ impl InodeTrait for Inode {
         };
     }
 
+    fn set_name(&mut self, name: String) {
+        match self {
+            Inode::FileInode(ref mut a) =>  a.name = name,
+            Inode::DirectoryInode(ref mut b) => b.name = name,
+            Inode::LinkInode(ref mut c) => c.name = name,
+        };
+    }
+
     fn set_data(&mut self, data: Vec<u8>) {
         match self {
             Inode::FileInode(ref mut a) =>  a.data = data.clone(),
+            Inode::DirectoryInode(_) => todo!(),
+            Inode::LinkInode(_) => todo!(),
+        };
+    }
+
+    fn write_data(&mut self, data: &[u8], offset: usize) {
+        match self {
+            Inode::FileInode(ref mut a) =>  a.data.splice(offset.., data.iter().copied()),
             Inode::DirectoryInode(_) => todo!(),
             Inode::LinkInode(_) => todo!(),
         };
